@@ -1169,6 +1169,25 @@ html, body { height: 100%; background: var(--bg); color: var(--fg); font-family:
           <div class="more-section-title">Designations</div>
           <div class="desig-grid" id="desig-grid"></div>
         </div>
+        <div class="more-section">
+          <div class="more-section-title">Spawn Settings</div>
+          <div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap;margin-bottom:8px">
+            <label style="font-size:12px;color:#aaa">Min slot</label>
+            <input id="spawn-range-min" type="number" min="1" max="99" value="17" style="width:60px;padding:4px 6px;background:#1a1a2e;border:1px solid #333;color:#eee;border-radius:4px">
+            <label style="font-size:12px;color:#aaa">Max slot</label>
+            <input id="spawn-range-max" type="number" min="1" max="99" value="32" style="width:60px;padding:4px 6px;background:#1a1a2e;border:1px solid #333;color:#eee;border-radius:4px">
+          </div>
+          <div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap">
+            <label style="font-size:12px;color:#aaa">Tmux dir</label>
+            <input id="spawn-tmux-dir" type="text" value="" placeholder="~/.claude/tmux" style="flex:1;min-width:180px;padding:4px 6px;background:#1a1a2e;border:1px solid #333;color:#eee;border-radius:4px;font-size:12px">
+            <button id="spawn-range-save" style="padding:4px 12px">Save</button>
+          </div>
+          <div style="margin-top:8px;display:flex;gap:8px;align-items:center">
+            <input type="checkbox" id="spawn-debug-toggle">
+            <label for="spawn-debug-toggle" style="font-size:12px;color:#aaa;cursor:pointer">Debug logging</label>
+          </div>
+          <pre id="spawn-debug-log" style="display:none;margin-top:8px;padding:8px;background:#0a0a1a;border:1px solid #333;border-radius:4px;font-size:11px;color:#8f8;max-height:200px;overflow-y:auto;white-space:pre-wrap;word-break:break-all"></pre>
+        </div>
       </div>
     </div>
 
@@ -1431,6 +1450,9 @@ html, body { height: 100%; background: var(--bg); color: var(--fg); font-family:
   let previousTab = 'fleet-panel'; // remember which tab was active before session view
   let taskMode = 'auto';
   let vimMode = false;
+  let spawnSlotMin = 17;
+  let spawnSlotMax = 32;
+  let spawnTmuxDir = '';
   let manualTarget = null;
   let activeTaskTab = 'inprogress';
   let selectedTaskIds = new Set();
@@ -1750,6 +1772,36 @@ html, body { height: 100%; background: var(--bg); color: var(--fg); font-family:
         if (activeTab === 'fleet-panel') renderGrid();
         break;
       case 'vim:status': vimMode = msg.enabled; updateVimToggles(); break;
+      case 'spawn:config':
+        if (typeof msg.min === 'number' && typeof msg.max === 'number') {
+          spawnSlotMin = msg.min;
+          spawnSlotMax = msg.max;
+        }
+        if (msg.tmuxDir) spawnTmuxDir = msg.tmuxDir;
+        const srMin = document.getElementById('spawn-range-min');
+        const srMax = document.getElementById('spawn-range-max');
+        const srDir = document.getElementById('spawn-tmux-dir');
+        if (srMin) srMin.value = spawnSlotMin;
+        if (srMax) srMax.value = spawnSlotMax;
+        if (srDir) srDir.value = spawnTmuxDir;
+        break;
+      case 'spawn:debug': {
+        const cb = document.getElementById('spawn-debug-toggle');
+        const logEl = document.getElementById('spawn-debug-log');
+        if (cb) cb.checked = msg.enabled;
+        if (logEl) logEl.style.display = msg.enabled ? 'block' : 'none';
+        break;
+      }
+      case 'spawn:log': {
+        const logEl = document.getElementById('spawn-debug-log');
+        if (logEl) {
+          logEl.style.display = 'block';
+          const ts = new Date().toLocaleTimeString();
+          logEl.textContent += `[${ts}] ${msg.message}\n`;
+          logEl.scrollTop = logEl.scrollHeight;
+        }
+        break;
+      }
       case 'spawn:slots': renderSpawnSlots(msg.slots || []); break;
       case 'spawn:done':
         if (msg.success) showToast('Spawned', `Session ${msg.num} at ${msg.repoDir || ''}`, 'success');
@@ -3400,13 +3452,15 @@ html, body { height: 100%; background: var(--bg); color: var(--fg); font-family:
   let selectedSpawnSlot = null;
 
   spawnBtn.addEventListener('click', () => {
-    if (ws && ws.readyState === 1) ws.send(JSON.stringify({ type: 'spawn:slots' }));
     document.getElementById('spawn-name').value = '';
     document.getElementById('spawn-git-url').value = '';
     document.getElementById('spawn-base-dir').value = localStorage.getItem('hive-spawn-baseDir') || '~/Coding';
     document.getElementById('spawn-skip-perms').checked = true;
     selectedSpawnSlot = null;
+    // Pre-render all slots as available, then let server response update occupancy
+    renderSpawnSlots([...Array(spawnSlotMax - spawnSlotMin + 1)].map((_, i) => spawnSlotMin + i));
     spawnDialog.classList.add('visible');
+    if (ws && ws.readyState === 1) ws.send(JSON.stringify({ type: 'spawn:slots' }));
   });
 
   document.getElementById('spawn-cancel').addEventListener('click', closeSpawnDialog);
@@ -3439,7 +3493,7 @@ html, body { height: 100%; background: var(--bg); color: var(--fg); font-family:
     grid.innerHTML = '';
     const avSet = new Set(available);
     selectedSpawnSlot = null;
-    for (let i = 17; i <= 32; i++) {
+    for (let i = spawnSlotMin; i <= spawnSlotMax; i++) {
       const btn = document.createElement('button');
       btn.className = `slot-btn${avSet.has(i) ? '' : ' occupied'}`;
       btn.textContent = i;
@@ -3453,6 +3507,30 @@ html, body { height: 100%; background: var(--bg); color: var(--fg); font-family:
       grid.appendChild(btn);
     }
   }
+
+  // Spawn range settings
+  document.getElementById('spawn-range-save').addEventListener('click', () => {
+    const min = parseInt(document.getElementById('spawn-range-min').value);
+    const max = parseInt(document.getElementById('spawn-range-max').value);
+    const tmuxDir = document.getElementById('spawn-tmux-dir').value.trim();
+    if (isNaN(min) || isNaN(max) || min < 1 || max > 99 || min > max) {
+      showToast('Error', 'Invalid range (min 1-99, min <= max)', 'error');
+      return;
+    }
+    if (ws && ws.readyState === 1) {
+      ws.send(JSON.stringify({ type: 'spawn:config:update', min, max, tmuxDir: tmuxDir || undefined }));
+      showToast('Spawn Settings', `Updated: slots ${min}-${max}`, 'success');
+    }
+  });
+
+  document.getElementById('spawn-debug-toggle').addEventListener('change', (e) => {
+    const enabled = e.target.checked;
+    const logEl = document.getElementById('spawn-debug-log');
+    if (logEl) logEl.style.display = enabled ? 'block' : 'none';
+    if (ws && ws.readyState === 1) {
+      ws.send(JSON.stringify({ type: 'spawn:debug', enabled }));
+    }
+  });
 
   // ── PMs panel ──────────────────────────────────
   function renderPMs() {
