@@ -419,6 +419,7 @@ html, body { height: 100%; background: var(--bg); color: var(--fg); font-family:
 .task-card:active { background: var(--bg3); }
 .task-card.queued { border-left-color: var(--purple); }
 .task-card.dispatched { border-left-color: var(--yellow); }
+.task-card.parked { border-left-color: var(--cyan); opacity: 0.85; }
 .task-card.completed { border-left-color: var(--green); opacity: 0.7; }
 .task-card.failed { border-left-color: var(--red); opacity: 0.7; }
 .task-card.selected { border-left-color: var(--purple); background: rgba(189,147,249,0.08); }
@@ -1033,12 +1034,15 @@ html, body { height: 100%; background: var(--bg); color: var(--fg); font-family:
         <div class="tasks-list-pane">
           <div class="tasks-tabs">
             <button class="tasks-tab active" data-tab="inprogress">In Progress</button>
+            <button class="tasks-tab" data-tab="parked">Parked</button>
             <button class="tasks-tab" data-tab="queued">Queued</button>
             <button class="tasks-tab" data-tab="completed">Completed</button>
             <button class="tasks-create-btn" id="tasks-create-btn">+ Create</button>
           </div>
           <div class="tasks-bulk-bar" id="tasks-bulk-bar" style="display:none">
             <span class="bulk-count" id="tasks-bulk-count">0 selected</span>
+            <button class="bulk-btn" id="tasks-bulk-start" style="background:var(--green);color:var(--bg)">Start</button>
+            <button class="bulk-btn" id="tasks-bulk-park" style="background:rgba(139,233,253,0.2);color:var(--cyan)">Park</button>
             <button class="bulk-btn cancel" id="tasks-bulk-cancel">Cancel</button>
             <button class="bulk-btn done" id="tasks-bulk-done">Mark Done</button>
           </div>
@@ -1232,7 +1236,7 @@ html, body { height: 100%; background: var(--bg); color: var(--fg); font-family:
     <div class="dialog-title">Spawn Agent</div>
     <div class="spawn-form-field">
       <label class="spawn-form-label">Base Directory</label>
-      <input class="spawn-form-input" id="spawn-base-dir" type="text" value="~/ai-dev" autocomplete="off">
+      <input class="spawn-form-input" id="spawn-base-dir" type="text" value="~/Coding" autocomplete="off">
     </div>
     <div class="spawn-form-field">
       <label class="spawn-form-label">Name <span style="color:var(--red)">*</span></label>
@@ -1241,6 +1245,10 @@ html, body { height: 100%; background: var(--bg); color: var(--fg); font-family:
     <div class="spawn-form-field">
       <label class="spawn-form-label">Git URL <span style="color:var(--dim)">(optional)</span></label>
       <input class="spawn-form-input" id="spawn-git-url" type="text" placeholder="git@github.com:org/repo.git" autocomplete="off">
+    </div>
+    <div class="spawn-form-field" style="flex-direction:row;align-items:center;gap:8px">
+      <input type="checkbox" id="spawn-skip-perms" checked>
+      <label for="spawn-skip-perms" style="font-size:12px;color:var(--dim);cursor:pointer">Skip permissions (--dangerously-skip-permissions)</label>
     </div>
     <div class="spawn-form-field">
       <label class="spawn-form-label">Select Slot</label>
@@ -1620,8 +1628,8 @@ html, body { height: 100%; background: var(--bg); color: var(--fg); font-family:
 
   function updateTasksBadge() {
     const badge = $('#tasks-badge');
-    const queued = tasks.filter(t => t.status === 'queued').length;
-    if (queued > 0) { badge.textContent = queued; badge.classList.add('visible'); }
+    const active = tasks.filter(t => t.status === 'queued' || t.status === 'parked').length;
+    if (active > 0) { badge.textContent = active; badge.classList.add('visible'); }
     else { badge.classList.remove('visible'); }
   }
 
@@ -1692,7 +1700,7 @@ html, body { height: 100%; background: var(--bg); color: var(--fg); font-family:
       case 'keys:done': break;
       case 'error': showToast('Error', msg.message, 'error'); break;
       case 'tasks:list': tasks = msg.tasks || []; renderTasks(); updateTasksBadge(); break;
-      case 'task:created': case 'task:dispatched': case 'task:completed': case 'task:failed': {
+      case 'task:created': case 'task:dispatched': case 'task:completed': case 'task:failed': case 'task:parked': case 'task:unparked': {
         const idx = tasks.findIndex(t => t.id === msg.task.id);
         if (idx >= 0) tasks[idx] = msg.task; else tasks.unshift(msg.task);
         renderTasks(); updateTasksBadge(); break;
@@ -2152,10 +2160,13 @@ html, body { height: 100%; background: var(--bg); color: var(--fg); font-family:
       selectedTaskIds.clear();
       tasksSelectedTaskId = null;
       $$('.tasks-tab').forEach(t => t.classList.toggle('active', t.dataset.tab === activeTaskTab));
-      // Close live session when switching to queued tab
+      // Close live session when switching away from in-progress tab
       if (activeTaskTab === 'queued') {
         closeTaskSession();
         showTasksEmptyState('Select an in-progress task to view its session');
+      } else if (activeTaskTab === 'parked') {
+        closeTaskSession();
+        showTasksEmptyState('Click a parked task to view its snapshot');
       } else if (activeTaskTab === 'completed') {
         closeTaskSession();
         showTasksEmptyState('Click a completed task to view its snapshot');
@@ -2488,6 +2499,7 @@ html, body { height: 100%; background: var(--bg); color: var(--fg); font-family:
     for (const id of selectedTaskIds) { if (!taskIds.has(id)) selectedTaskIds.delete(id); }
 
     const dispatched = tasks.filter(t => t.status === 'dispatched');
+    const parked = tasks.filter(t => t.status === 'parked');
     const queued = tasks.filter(t => t.status === 'queued');
     const completed = tasks.filter(t => t.status === 'completed' || t.status === 'failed');
     let html = '';
@@ -2500,6 +2512,13 @@ html, body { height: 100%; background: var(--bg); color: var(--fg); font-family:
         html = '<div class="feed-empty">No tasks in progress.</div>';
       }
       visibleTasks = dispatched;
+    } else if (activeTaskTab === 'parked') {
+      if (parked.length) {
+        for (const t of parked) html += taskCardHtml(t, 'parked');
+      } else {
+        html = '<div class="feed-empty">No parked tasks.</div>';
+      }
+      visibleTasks = parked;
     } else if (activeTaskTab === 'queued') {
       if (queued.length) {
         for (const t of queued) html += taskCardHtml(t, 'queued');
@@ -2549,6 +2568,11 @@ html, body { height: 100%; background: var(--bg); color: var(--fg); font-family:
           // Update selection highlight
           tasksScroll.querySelectorAll('.task-card').forEach(c => c.classList.remove('selected'));
           card.classList.add('selected');
+        } else if (activeTaskTab === 'parked' && task.status === 'parked' && task.snapshot) {
+          tasksSelectedTaskId = task.id;
+          showTaskSnapshot(task.id);
+          tasksScroll.querySelectorAll('.task-card').forEach(c => c.classList.remove('selected'));
+          card.classList.add('selected');
         } else if (activeTaskTab === 'completed' && (task.status === 'completed' || task.status === 'failed')) {
           tasksSelectedTaskId = task.id;
           showTaskSnapshot(task.id);
@@ -2578,22 +2602,57 @@ html, body { height: 100%; background: var(--bg); color: var(--fg); font-family:
     if (count === 0) { bar.style.display = 'none'; return; }
     bar.style.display = '';
     document.getElementById('tasks-bulk-count').textContent = `${count} selected`;
+    const startBtn = document.getElementById('tasks-bulk-start');
+    const parkBtn = document.getElementById('tasks-bulk-park');
     const cancelBtn = document.getElementById('tasks-bulk-cancel');
     const doneBtn = document.getElementById('tasks-bulk-done');
     const hasQueued = [...selectedTaskIds].some(id => { const t = tasks.find(x => x.id === id); return t && t.status === 'queued'; });
     const hasDispatched = [...selectedTaskIds].some(id => { const t = tasks.find(x => x.id === id); return t && t.status === 'dispatched'; });
+    const hasParked = [...selectedTaskIds].some(id => { const t = tasks.find(x => x.id === id); return t && t.status === 'parked'; });
     const hasCompleted = [...selectedTaskIds].some(id => { const t = tasks.find(x => x.id === id); return t && (t.status === 'completed' || t.status === 'failed'); });
-    cancelBtn.style.display = (hasQueued || hasDispatched) ? '' : 'none';
+    startBtn.style.display = (hasQueued || hasParked) ? '' : 'none';
+    parkBtn.style.display = hasDispatched ? '' : 'none';
+    cancelBtn.style.display = (hasQueued || hasDispatched || hasParked) ? '' : 'none';
     doneBtn.style.display = (hasDispatched || hasCompleted) ? '' : 'none';
     doneBtn.textContent = hasDispatched ? 'Mark Done' : 'Clear';
   }
 
   // Bulk action handlers
+  document.getElementById('tasks-bulk-start').addEventListener('click', () => {
+    if (!ws || ws.readyState !== 1) return;
+    let startCount = 0;
+    for (const id of selectedTaskIds) {
+      const t = tasks.find(x => x.id === id);
+      if (t && (t.status === 'queued' || t.status === 'parked')) {
+        ws.send(JSON.stringify({ type: 'task:start', taskId: id }));
+        startCount++;
+      }
+    }
+    if (startCount) showToast('Starting', `Dispatching ${startCount} task(s) to idle sessions`, 'success');
+    selectedTaskIds.clear();
+    updateTasksBulkBar();
+  });
+
+  document.getElementById('tasks-bulk-park').addEventListener('click', () => {
+    if (!ws || ws.readyState !== 1) return;
+    let parkCount = 0;
+    for (const id of selectedTaskIds) {
+      const t = tasks.find(x => x.id === id);
+      if (t && t.status === 'dispatched') {
+        ws.send(JSON.stringify({ type: 'task:park', taskId: id }));
+        parkCount++;
+      }
+    }
+    if (parkCount) showToast('Parked', `Parked ${parkCount} task(s) — sessions freed`, 'success');
+    selectedTaskIds.clear();
+    updateTasksBulkBar();
+  });
+
   document.getElementById('tasks-bulk-cancel').addEventListener('click', () => {
     if (!ws || ws.readyState !== 1) return;
     for (const id of selectedTaskIds) {
       const t = tasks.find(x => x.id === id);
-      if (t && (t.status === 'queued' || t.status === 'dispatched')) {
+      if (t && (t.status === 'queued' || t.status === 'dispatched' || t.status === 'parked')) {
         ws.send(JSON.stringify({ type: 'task:cancel', taskId: id }));
       }
     }
@@ -2652,6 +2711,13 @@ html, body { height: 100%; background: var(--bg); color: var(--fg); font-family:
       }
       const checked = selectedTaskIds.has(t.id) ? ' checked' : '';
       return `<div class="task-card-row"><input type="checkbox" class="task-checkbox" data-id="${t.id}"${checked}><div class="task-card dispatched${selected}" data-id="${t.id}"><div class="task-text">${esc(t.text)}</div><div class="task-meta"><span>${meta} · ${ago}</span>${waitBadge}${desigBadge}${prBadge}${sessionBadge}</div></div></div>`;
+    }
+    if (tabType === 'parked') {
+      const parkedAgo = t.parkedAt ? timeAgo(t.parkedAt) : ago;
+      const fromBadge = t.parkedFrom ? `<span class="task-session-badge">was S:${t.parkedFrom}</span>` : '';
+      const snapshotBadge = t.snapshot ? `<span style="color:var(--cyan);font-size:11px">has snapshot</span>` : '';
+      const checked = selectedTaskIds.has(t.id) ? ' checked' : '';
+      return `<div class="task-card-row"><input type="checkbox" class="task-checkbox" data-id="${t.id}"${checked}><div class="task-card parked${selected}" data-id="${t.id}"><div class="task-text">${esc(t.text)}</div><div class="task-meta"><span>${meta} · parked ${parkedAgo}</span>${fromBadge}${snapshotBadge}${desigBadge}${prBadge}</div></div></div>`;
     }
     if (tabType === 'queued') {
       const editBtn = `<button class="task-edit-btn" data-id="${t.id}">Edit</button>`;
@@ -3329,7 +3395,8 @@ html, body { height: 100%; background: var(--bg); color: var(--fg); font-family:
     if (ws && ws.readyState === 1) ws.send(JSON.stringify({ type: 'spawn:slots' }));
     document.getElementById('spawn-name').value = '';
     document.getElementById('spawn-git-url').value = '';
-    document.getElementById('spawn-base-dir').value = '~/ai-dev';
+    document.getElementById('spawn-base-dir').value = localStorage.getItem('hive-spawn-baseDir') || '~/Coding';
+    document.getElementById('spawn-skip-perms').checked = true;
     selectedSpawnSlot = null;
     spawnDialog.classList.add('visible');
   });
@@ -3340,9 +3407,12 @@ html, body { height: 100%; background: var(--bg); color: var(--fg); font-family:
   function getSpawnParams(slotNum) {
     const name = document.getElementById('spawn-name').value.trim();
     if (!name) { showToast('Error', 'Agent name is required', 'error'); return null; }
-    const baseDir = document.getElementById('spawn-base-dir').value.trim() || '~/ai-dev';
+    const baseDir = document.getElementById('spawn-base-dir').value.trim() || '~/Coding';
     const gitUrl = document.getElementById('spawn-git-url').value.trim() || undefined;
-    return { num: slotNum, baseDir, name, gitUrl };
+    const skipPermissions = document.getElementById('spawn-skip-perms').checked;
+    // Remember baseDir for next time
+    localStorage.setItem('hive-spawn-baseDir', baseDir);
+    return { num: slotNum, baseDir, name, gitUrl, skipPermissions };
   }
 
   document.getElementById('spawn-next').addEventListener('click', () => {

@@ -9,7 +9,10 @@ module.exports = {
     pattern: /^\d+/,
 
     // Map session number → repo directory
-    repoDir: (n) => path.join(os.homedir(), `ai-dev/webplatform${n}`),
+    repoDir: (n) => {
+      if (n === 11) return path.join(os.homedir(), 'Coding/Agentic/webplatform-pr-checks');
+      return path.join(os.homedir(), `Coding/webplatform${n}`);
+    },
 
     // Which pane index runs Claude Code (depends on your tmux layout)
     claudePane: 1,
@@ -20,6 +23,7 @@ module.exports = {
       2: 'Ideas',
       3: 'Urgent',
       4: 'Tests',
+      11: 'PR-Checks',
     },
   },
 

@@ -262,14 +262,33 @@ class ProjectManager extends EventEmitter {
 
     const jql = source.jql || '';
     const fields = 'summary,issuetype,customfield_10016,priority,labels';
-    const encodedJql = encodeURIComponent(jql);
-    const urlStr = `${baseUrl}/rest/api/2/search?jql=${encodedJql}&fields=${fields}&maxResults=50`;
     const auth = Buffer.from(`${email}:${apiToken}`).toString('base64');
-
-    const data = await this._httpRequest(urlStr, {
+    const headers = {
       'Authorization': `Basic ${auth}`,
       'Accept': 'application/json',
-    });
+      'Content-Type': 'application/json',
+    };
+
+    // Try v3 POST endpoint first (Atlassian deprecated v2 GET in 2025),
+    // fall back to v2 GET if v3 fails (on-prem / older JIRA).
+    let data;
+    try {
+      const urlStr = `${baseUrl}/rest/api/3/search/jql`;
+      data = await this._httpRequest(urlStr, headers, 'POST', JSON.stringify({
+        jql,
+        fields: fields.split(','),
+        maxResults: 50,
+      }));
+    } catch (e) {
+      if (e.message.includes('404') || e.message.includes('405')) {
+        const encodedJql = encodeURIComponent(jql);
+        const urlStr = `${baseUrl}/rest/api/2/search?jql=${encodedJql}&fields=${fields}&maxResults=50`;
+        data = await this._httpRequest(urlStr, headers);
+      } else {
+        throw e;
+      }
+    }
+
     return (data.issues || []).map(i => ({
       key: i.key,
       summary: i.fields.summary,
@@ -386,32 +405,37 @@ class ProjectManager extends EventEmitter {
     }));
   }
 
-  _httpRequest(urlStr, headers) {
+  _httpRequest(urlStr, headers, method = 'GET', body = null) {
     return new Promise((resolve, reject) => {
       const url = new URL(urlStr);
       const mod = url.protocol === 'https:' ? https : http;
 
-      const req = mod.get(urlStr, {
+      const opts = {
+        method,
         headers: { ...headers },
         timeout: 15000,
-      }, (res) => {
-        let body = '';
-        res.on('data', (chunk) => body += chunk);
+      };
+
+      const req = mod.request(urlStr, opts, (res) => {
+        let resBody = '';
+        res.on('data', (chunk) => resBody += chunk);
         res.on('end', () => {
           if (res.statusCode >= 200 && res.statusCode < 300) {
             try {
-              resolve(JSON.parse(body));
+              resolve(JSON.parse(resBody));
             } catch (e) {
               reject(new Error(`Invalid JSON response: ${e.message}`));
             }
           } else {
-            reject(new Error(`HTTP ${res.statusCode}: ${body.slice(0, 200)}`));
+            reject(new Error(`HTTP ${res.statusCode}: ${resBody.slice(0, 200)}`));
           }
         });
       });
 
       req.on('error', (err) => reject(new Error(`Request failed: ${err.message}`)));
       req.on('timeout', () => { req.destroy(); reject(new Error('Request timed out')); });
+      if (body) req.write(body);
+      req.end();
     });
   }
 

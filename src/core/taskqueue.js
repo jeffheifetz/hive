@@ -2,11 +2,28 @@ const EventEmitter = require('events');
 const fs = require('fs');
 const path = require('path');
 const os = require('os');
-const { execSync } = require('child_process');
+const { execSync, spawn: spawnChild } = require('child_process');
 const relay = require('./relay');
 const fleet = require('./fleet');
 
 const STATE_FILE = path.join(__dirname, '..', '..', '.hive-state.json');
+
+// Task statuses
+const TASK = {
+  QUEUED: 'queued',
+  DISPATCHED: 'dispatched',
+  COMPLETED: 'completed',
+  FAILED: 'failed',
+  CANCELLED: 'cancelled',
+  PARKED: 'parked',
+};
+
+// Approval statuses
+const APPROVAL = {
+  PENDING: 'pending',
+  APPROVED: 'approved',
+  DENIED: 'denied',
+};
 
 let nextTaskId = 1;
 let nextApprovalId = 1;
@@ -61,7 +78,7 @@ class TaskQueue extends EventEmitter {
       mode, // 'auto' or 'manual'
       targetSession: targetSession || null,
       designation: designation || null,
-      status: 'queued',
+      status: TASK.QUEUED,
       assignedTo: null,
       createdAt: Date.now(),
       dispatchedAt: null,
@@ -98,7 +115,7 @@ class TaskQueue extends EventEmitter {
       mode: 'manual',
       targetSession: sessionNum,
       designation: null,
-      status: 'dispatched',
+      status: TASK.DISPATCHED,
       assignedTo: sessionNum,
       createdAt: Date.now(),
       dispatchedAt: Date.now(),
@@ -121,7 +138,7 @@ class TaskQueue extends EventEmitter {
 
   updateTask(taskId, updates) {
     const task = this.tasks.get(taskId);
-    if (!task || task.status !== 'queued') return null;
+    if (!task || task.status !== TASK.QUEUED) return null;
 
     const allowed = ['text', 'mode', 'targetSession', 'designation'];
     for (const key of allowed) {
@@ -134,12 +151,12 @@ class TaskQueue extends EventEmitter {
 
   cancelTask(taskId) {
     const task = this.tasks.get(taskId);
-    if (!task || task.status === 'completed' || task.status === 'failed') return null;
+    if (!task || task.status === TASK.COMPLETED || task.status === TASK.FAILED) return null;
 
-    if (task.status === 'dispatched' && task.assignedTo) {
+    if (task.status === TASK.DISPATCHED && task.assignedTo) {
       this.activeTaskBySession.delete(task.assignedTo);
     }
-    task.status = 'cancelled';
+    task.status = TASK.CANCELLED;
     this.emit('task:cancelled', task);
     this.pushFeed('task', task.assignedTo, `Task cancelled: "${task.text}"`);
     return task;
@@ -147,9 +164,9 @@ class TaskQueue extends EventEmitter {
 
   completeTask(taskId, result, snapshot, snapshotCols) {
     const task = this.tasks.get(taskId);
-    if (!task || task.status !== 'dispatched') return null;
+    if (!task || task.status !== TASK.DISPATCHED) return null;
 
-    task.status = 'completed';
+    task.status = TASK.COMPLETED;
     task.completedAt = Date.now();
     task.result = result || null;
     task.snapshot = snapshot || null;
@@ -175,9 +192,9 @@ class TaskQueue extends EventEmitter {
 
   failTask(taskId, error) {
     const task = this.tasks.get(taskId);
-    if (!task || task.status !== 'dispatched') return null;
+    if (!task || task.status !== TASK.DISPATCHED) return null;
 
-    task.status = 'failed';
+    task.status = TASK.FAILED;
     task.completedAt = Date.now();
     task.result = error;
 
@@ -189,6 +206,83 @@ class TaskQueue extends EventEmitter {
     this.emit('task:failed', task);
     this.pushFeed('task', task.assignedTo,
       `Task failed: "${task.text}" -- ${error}`);
+    return task;
+  }
+
+  parkTask(taskId, snapshot, snapshotCols) {
+    const task = this.tasks.get(taskId);
+    if (!task || task.status !== TASK.DISPATCHED) return null;
+
+    task.status = TASK.PARKED;
+    task.parkedAt = Date.now();
+    task.parkedFrom = task.assignedTo;
+    task.snapshot = snapshot || null;
+    task.snapshotCols = snapshotCols || 0;
+
+    if (task.assignedTo) {
+      this.activeTaskBySession.delete(task.assignedTo);
+      this.dispatchLock.delete(task.assignedTo);
+    }
+    task.assignedTo = null;
+
+    this.emit('task:parked', task);
+    this.pushFeed('task', task.parkedFrom,
+      `Task parked: "${task.text}" (was session ${task.parkedFrom})`);
+    this._saveState();
+    // Session is free now — try dispatching queued tasks
+    this._tryAutoDispatch().catch(err =>
+      console.error('Auto-dispatch error:', err.message));
+    return task;
+  }
+
+  unparkTask(taskId) {
+    const task = this.tasks.get(taskId);
+    if (!task || task.status !== TASK.PARKED) return null;
+
+    task.status = TASK.QUEUED;
+    task.unparkedAt = Date.now();
+
+    this.emit('task:unparked', task);
+    this.pushFeed('task', null, `Task unparked: "${task.text}"`);
+    this._saveState();
+    // Try auto-dispatching the freshly unparked task
+    this._tryAutoDispatch().catch(err =>
+      console.error('Auto-dispatch error:', err.message));
+    return task;
+  }
+
+  /**
+   * Manually dispatch a queued or parked task.
+   * If sessionNum is provided, dispatch to that session.
+   * Otherwise, find any idle session.
+   */
+  async startTask(taskId, sessionNum) {
+    const task = this.tasks.get(taskId);
+    if (!task || (task.status !== TASK.QUEUED && task.status !== TASK.PARKED)) return null;
+
+    // If parked, move back to queued first
+    if (task.status === TASK.PARKED) {
+      task.status = TASK.QUEUED;
+      task.unparkedAt = Date.now();
+    }
+
+    if (sessionNum) {
+      const dispatched = await this._dispatchTask(task, sessionNum);
+      if (!dispatched) throw new Error(`Session ${sessionNum} is not idle or not found`);
+      return task;
+    }
+
+    // No session specified — find any idle session
+    const sessions = await fleet.getFleetStatus(this.config, this.router);
+    const idle = sessions.filter(s =>
+      s.state === 'idle'
+      && !this.dispatchLock.has(s.num)
+      && !this.activeTaskBySession.has(s.num)
+    );
+    if (!idle.length) throw new Error('No idle sessions available');
+
+    const dispatched = await this._dispatchTask(task, idle[0].num);
+    if (!dispatched) throw new Error('Dispatch failed — session may have become busy');
     return task;
   }
 
@@ -212,7 +306,7 @@ class TaskQueue extends EventEmitter {
     }
 
     this.dispatchLock.add(sessionNum);
-    task.status = 'dispatched';
+    task.status = TASK.DISPATCHED;
     task.assignedTo = sessionNum;
     task.dispatchedAt = Date.now();
     task.lastActivityAt = Date.now();
@@ -258,7 +352,7 @@ class TaskQueue extends EventEmitter {
 
   async _tryAutoDispatch() {
     const queuedTasks = Array.from(this.tasks.values())
-      .filter(t => t.status === 'queued' && t.mode === 'auto');
+      .filter(t => t.status === TASK.QUEUED && t.mode === 'auto');
     if (!queuedTasks.length) return;
 
     const sessions = await fleet.getFleetStatus(this.config, this.router);
@@ -273,7 +367,7 @@ class TaskQueue extends EventEmitter {
     // Dispatch one task per idle session (not all at once)
     for (const session of idleAuto) {
       const task = queuedTasks.find(t => {
-        if (t.status !== 'queued') return false;
+        if (t.status !== TASK.QUEUED) return false;
         if (t.designation) {
           return this.designations.get(session.num) === t.designation;
         }
@@ -363,11 +457,11 @@ class TaskQueue extends EventEmitter {
     return this.config.sessions.repoDir(num);
   }
 
-  async spawnSession({ num, baseDir, name, gitUrl } = {}) {
+  async spawnSession({ num, baseDir, name, gitUrl, skipPermissions } = {}) {
     if (!name) throw new Error('Agent name is required');
 
     // Resolve base directory
-    baseDir = (baseDir || '~/ai-dev').replace(/^~/, os.homedir());
+    baseDir = (baseDir || '~/Coding').replace(/^~/, os.homedir());
 
     // Pick slot
     if (num === undefined || num === null) {
@@ -378,32 +472,53 @@ class TaskQueue extends EventEmitter {
     if (num < 17 || num > 32) throw new Error('Spawn slots must be 17-32');
 
     const sessions = await fleet.getFleetStatus(this.config, this.router);
-    if (sessions.find(s => s.num === num)) {
-      throw new Error(`Slot ${num} is already occupied`);
-    }
+    const existing = sessions.find(s => s.num === num);
 
-    // Build repo path: baseDir/name+num (e.g. ~/ai-dev/ios17)
+    // Build repo path: baseDir/name+num (e.g. ~/Coding/ios17)
     const repoDir = path.join(baseDir, `${name}${num}`);
 
-    // Clone or create directory
-    if (gitUrl) {
-      try {
-        execSync(`git clone ${gitUrl} "${repoDir}"`, { timeout: 60000, stdio: 'pipe' });
-      } catch (err) {
-        throw new Error(`Git clone failed: ${err.message}`);
+    // Re-spawn: if session exists in tmux, reuse it
+    if (existing) {
+      const prev = this.spawnedAgents.get(num);
+      if (prev && prev.repoDir === repoDir) {
+        // Same slot, same dir — already running, just update metadata
+        this.pushFeed('state', num, `Agent "${name}" already running in slot ${num}`);
+        return { num, repoDir };
       }
-    } else {
-      try {
-        fs.mkdirSync(repoDir, { recursive: true });
-      } catch (err) {
-        throw new Error(`Failed to create directory: ${err.message}`);
+      // Different agent in this slot — can't overwrite a live session
+      throw new Error(`Slot ${num} is occupied by "${existing.name}". Kill it first or pick another slot.`);
+    }
+
+    // Prepare directory (skip if it already exists from a previous spawn)
+    const dirExists = fs.existsSync(repoDir);
+    if (!dirExists) {
+      if (gitUrl) {
+        try {
+          execSync(`git clone ${gitUrl} "${repoDir}"`, { timeout: 60000, stdio: 'pipe' });
+        } catch (err) {
+          throw new Error(`Git clone failed: ${err.message}`);
+        }
+      } else {
+        try {
+          fs.mkdirSync(repoDir, { recursive: true });
+        } catch (err) {
+          throw new Error(`Failed to create directory: ${err.message}`);
+        }
       }
     }
 
-    // Start tmux session using agent.yml template
+    // Start tmux session in background using agent.yml template
     const agentYml = path.join(os.homedir(), 'dev', 'agents', 'tmux', 'agent.yml');
+    const env = { ...process.env };
+    if (skipPermissions) env.SKIP_PERMISSIONS = '1';
+
     try {
-      execSync(`tmuxinator start ${agentYml} N=${num} ROOT="${repoDir}"`, { timeout: 15000, stdio: 'pipe' });
+      const child = spawnChild('tmuxinator', ['start', agentYml, `N=${num}`, `ROOT=${repoDir}`], {
+        stdio: 'ignore',
+        detached: true,
+        env,
+      });
+      child.unref();
     } catch (err) {
       throw new Error(`Failed to start session ${num}: ${err.message}`);
     }
@@ -412,16 +527,18 @@ class TaskQueue extends EventEmitter {
     this.spawnedAgents.set(num, { repoDir, name });
     this._saveState();
 
-    // Wait for init then rename
-    await new Promise(r => setTimeout(r, 2000));
-    try {
-      const renameScript = path.join(os.homedir(), 'dev', 'agents', 'tmux', 'rename.sh');
-      execSync(`bash "${renameScript}"`, { timeout: 10000, stdio: 'pipe' });
-    } catch {
-      // Rename is best-effort
-    }
+    // Wait for init then rename (in background, don't block response)
+    setTimeout(() => {
+      try {
+        const renameScript = path.join(os.homedir(), 'dev', 'agents', 'tmux', 'rename.sh');
+        execSync(`bash "${renameScript}"`, { timeout: 10000, stdio: 'pipe' });
+      } catch {
+        // Rename is best-effort
+      }
+    }, 2000);
 
-    this.pushFeed('state', num, `Agent "${name}" spawned in slot ${num}`);
+    const action = dirExists ? 're-spawned (reused directory)' : 'spawned';
+    this.pushFeed('state', num, `Agent "${name}" ${action} in slot ${num}`);
     return { num, repoDir };
   }
 
@@ -464,14 +581,14 @@ class TaskQueue extends EventEmitter {
   createApproval(sessionNum, prompt) {
     // Don't create duplicate pending approvals for the same session
     for (const a of this.approvals.values()) {
-      if (a.session === sessionNum && a.status === 'pending') return a;
+      if (a.session === sessionNum && a.status === APPROVAL.PENDING) return a;
     }
 
     const approval = {
       id: String(nextApprovalId++),
       session: sessionNum,
       prompt,
-      status: 'pending', // 'pending' | 'approved' | 'denied'
+      status: APPROVAL.PENDING,
       createdAt: Date.now(),
       resolvedAt: null,
     };
@@ -483,9 +600,9 @@ class TaskQueue extends EventEmitter {
 
   async resolveApproval(approvalId, approved) {
     const approval = this.approvals.get(approvalId);
-    if (!approval || approval.status !== 'pending') return null;
+    if (!approval || approval.status !== APPROVAL.PENDING) return null;
 
-    approval.status = approved ? 'approved' : 'denied';
+    approval.status = approved ? APPROVAL.APPROVED : APPROVAL.DENIED;
     approval.resolvedAt = Date.now();
 
     // Send y or n key to the session
@@ -508,7 +625,7 @@ class TaskQueue extends EventEmitter {
 
   getPendingApprovals() {
     return Array.from(this.approvals.values())
-      .filter(a => a.status === 'pending');
+      .filter(a => a.status === APPROVAL.PENDING);
   }
 
   // -- Feed ---------------------------------------------------------
@@ -616,7 +733,7 @@ class TaskQueue extends EventEmitter {
         for (const t of data.tasks) {
           // Preserve dispatched tasks and their session assignments across restarts.
           // The session is still running in tmux — don't reset to queued or send /clear.
-          if (t.status === 'dispatched' && t.assignedTo) {
+          if (t.status === TASK.DISPATCHED && t.assignedTo) {
             this.activeTaskBySession.set(t.assignedTo, t.id);
             this.dispatchLock.add(t.assignedTo);
           }
@@ -634,9 +751,9 @@ class TaskQueue extends EventEmitter {
   _saveState() {
     const spawnedObj = {};
     for (const [num, info] of this.spawnedAgents) spawnedObj[num] = info;
-    // Persist active tasks (queued + dispatched only, not completed/cancelled/failed)
+    // Persist active tasks (queued + dispatched + parked, not completed/cancelled/failed)
     const tasksArr = Array.from(this.tasks.values())
-      .filter(t => t.status === 'queued' || t.status === 'dispatched')
+      .filter(t => t.status === TASK.QUEUED || t.status === TASK.DISPATCHED || t.status === TASK.PARKED)
       .map(t => ({ ...t }));
     const data = {
       autoSessions: Array.from(this.autoSessions),
@@ -721,7 +838,7 @@ class TaskQueue extends EventEmitter {
 
   getTasksList() {
     return Array.from(this.tasks.values())
-      .filter(t => t.status !== 'cancelled')
+      .filter(t => t.status !== TASK.CANCELLED)
       .sort((a, b) => b.createdAt - a.createdAt)
       .map(t => {
         const { snapshot, snapshotCols, ...rest } = t;
@@ -731,3 +848,5 @@ class TaskQueue extends EventEmitter {
 }
 
 module.exports = TaskQueue;
+module.exports.TASK = TASK;
+module.exports.APPROVAL = APPROVAL;

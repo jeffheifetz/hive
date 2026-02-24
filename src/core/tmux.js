@@ -69,14 +69,31 @@ function detectState(paneContent, config) {
   const lines = paneContent.split('\n').filter(l => l.trim());
   if (lines.length === 0) return 'off';
 
-  const lastLine = lines[lines.length - 1]
-    .replace(/[^\x20-\x7E]/g, ''); // strip non-printable
+  // Check raw lines for Claude Code idle/waiting indicators.
+  // Must check raw content because ❯ (U+276F) is stripped by ASCII filter.
+  const recentRaw = lines.slice(-15);
+  for (let i = recentRaw.length - 1; i >= 0; i--) {
+    const line = recentRaw[i];
+    // Empty input prompt: ❯ with no text after it
+    if (/❯\s*$/.test(line) && !/❯\s+\S/.test(line)) return 'idle';
+    // Tool approval prompt: ❯ pointing at a numbered option
+    if (/❯\s*\d+\./.test(line)) return 'idle';
+    // Permission/approval prompt footer
+    if (/Esc to cancel/.test(line)) return 'idle';
+    // Question UI with "Do you want to proceed"
+    if (/Do you want to proceed/.test(line)) return 'idle';
+  }
 
-  for (const pat of config.idlePatterns) {
-    if (pat.test(lastLine)) return 'idle';
+  // Check last few lines (stripped) for config patterns
+  const recentClean = recentRaw.map(l => l.replace(/[^\x20-\x7E]/g, ''));
+  for (const line of recentClean) {
+    for (const pat of config.idlePatterns) {
+      if (pat.test(line)) return 'idle';
+    }
   }
   for (const pat of config.offPatterns) {
-    if (pat.test(lastLine)) return 'off';
+    const lastClean = recentClean[recentClean.length - 1];
+    if (pat.test(lastClean)) return 'off';
   }
   return 'working';
 }

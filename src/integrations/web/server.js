@@ -101,7 +101,7 @@ function createWebServer(config, watcher, taskQueue, pmManager, router) {
 
   // Track authenticated clients
   const clients = new Set();
-  // Per-client terminal subscriptions: ws -> { interval, session }
+  // Per-client terminal subscriptions: ws -> { interval, session, lastContent }
   const termSubs = new Map();
   // Track worker connections: ws -> RemoteNode
   const workers = new Map();
@@ -288,17 +288,20 @@ function createWebServer(config, watcher, taskQueue, pmManager, router) {
         // Send immediately
         const { content: subContent, cols: subCols } = await capturePaneAnsi(node, paneTarget);
         ws.send(JSON.stringify({ type: 'terminal:data', session: msg.session, content: subContent, cols: subCols }));
-        // Poll every 2s
-        const interval = setInterval(async () => {
+        const sub = { interval: null, session: msg.session, lastContent: subContent };
+        // Poll every 2s — only send if content changed
+        sub.interval = setInterval(async () => {
           if (ws.readyState !== 1) { clearTermSub(ws); return; }
           try {
             const { content: pollContent, cols: pollCols } = await capturePaneAnsi(node, paneTarget);
+            if (pollContent === sub.lastContent) return;
+            sub.lastContent = pollContent;
             ws.send(JSON.stringify({ type: 'terminal:data', session: msg.session, content: pollContent, cols: pollCols }));
           } catch {
             // Node may have disconnected
           }
         }, 2000);
-        termSubs.set(ws, { interval, session: msg.session });
+        termSubs.set(ws, sub);
         break;
       }
 
@@ -516,6 +519,45 @@ function createWebServer(config, watcher, taskQueue, pmManager, router) {
         break;
       }
 
+      case 'task:park': {
+        if (!taskQueue) break;
+        // Capture snapshot of the session before parking
+        const parkTaskObj = taskQueue.tasks.get(msg.taskId);
+        let parkSnapshot = null, parkCols = 0;
+        if (parkTaskObj && parkTaskObj.assignedTo) {
+          try {
+            const found = await fleet.findSession(config, router, parkTaskObj.assignedTo);
+            if (found) {
+              const node = router.getNode(found.nodeId);
+              const paneTarget = `${found.name}:.${config.sessions.claudePane}`;
+              const { content, cols } = await capturePaneAnsi(node, paneTarget);
+              parkSnapshot = content;
+              parkCols = cols;
+            }
+          } catch { /* best-effort snapshot */ }
+        }
+        const parkedTask = taskQueue.parkTask(msg.taskId, parkSnapshot, parkCols);
+        if (parkedTask) broadcast({ type: 'task:parked', task: parkedTask });
+        break;
+      }
+
+      case 'task:unpark': {
+        if (!taskQueue) break;
+        const unparkedTask = taskQueue.unparkTask(msg.taskId);
+        if (unparkedTask) broadcast({ type: 'task:unparked', task: unparkedTask });
+        break;
+      }
+
+      case 'task:start': {
+        if (!taskQueue) break;
+        taskQueue.startTask(msg.taskId, msg.session || null).then((task) => {
+          if (task) ws.send(JSON.stringify({ type: 'task:started', task }));
+        }).catch((err) => {
+          ws.send(JSON.stringify({ type: 'error', message: err.message }));
+        });
+        break;
+      }
+
       case 'auto:toggle': {
         if (!taskQueue) break;
         taskQueue.toggleAutoSession(msg.session);
@@ -588,6 +630,7 @@ function createWebServer(config, watcher, taskQueue, pmManager, router) {
           baseDir: msg.baseDir,
           name: msg.name,
           gitUrl: msg.gitUrl,
+          skipPermissions: msg.skipPermissions,
         }).then((result) => {
           if (ws.readyState === 1) {
             ws.send(JSON.stringify({ type: 'spawn:done', success: true, num: result.num, repoDir: result.repoDir }));
@@ -773,6 +816,8 @@ function createWebServer(config, watcher, taskQueue, pmManager, router) {
     taskQueue.on('task:completed', (task) => broadcast({ type: 'task:completed', task }));
     taskQueue.on('task:failed', (task) => broadcast({ type: 'task:failed', task }));
     taskQueue.on('task:cancelled', (task) => broadcast({ type: 'task:cancelled', task }));
+    taskQueue.on('task:parked', (task) => broadcast({ type: 'task:parked', task }));
+    taskQueue.on('task:unparked', (task) => broadcast({ type: 'task:unparked', task }));
     taskQueue.on('task:updated', (task) => broadcast({ type: 'task:updated', task }));
     taskQueue.on('auto:changed', (sessions) => broadcast({ type: 'auto:status', sessions }));
     taskQueue.on('feed:new', (entry) => broadcast({ type: 'feed:new', entry }));
