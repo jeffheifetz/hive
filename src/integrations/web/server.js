@@ -150,6 +150,9 @@ function createWebServer(config, watcher, taskQueue, pmManager, router) {
             ws.send(JSON.stringify({ type: 'rules:list', rules: taskQueue.getRules() }));
             ws.send(JSON.stringify({ type: 'designations:status', designations: taskQueue.getDesignations() }));
             ws.send(JSON.stringify({ type: 'vim:status', enabled: taskQueue.vimMode }));
+            const spawnRange = taskQueue.getSpawnRange();
+            ws.send(JSON.stringify({ type: 'spawn:config', min: spawnRange.min, max: spawnRange.max, tmuxDir: spawnRange.tmuxDir }));
+            ws.send(JSON.stringify({ type: 'spawn:debug', enabled: taskQueue.spawnDebug }));
           }
           if (pmManager) {
             ws.send(JSON.stringify({ type: 'pm:list', pms: pmManager.getAll() }));
@@ -615,6 +618,25 @@ function createWebServer(config, watcher, taskQueue, pmManager, router) {
         break;
       }
 
+      // -- Spawn config messages -----------------------------------------------
+      case 'spawn:config:update': {
+        if (!taskQueue) break;
+        try {
+          taskQueue.setSpawnRange(msg.min, msg.max, msg.tmuxDir);
+          // broadcast happens via spawn:config:changed event bridge
+        } catch (err) {
+          ws.send(JSON.stringify({ type: 'error', message: err.message }));
+        }
+        break;
+      }
+
+      case 'spawn:debug': {
+        if (!taskQueue) break;
+        taskQueue.spawnDebug = !!msg.enabled;
+        broadcast({ type: 'spawn:debug', enabled: taskQueue.spawnDebug });
+        break;
+      }
+
       // -- Spawn messages ---------------------------------------------------
       case 'spawn:slots': {
         if (!taskQueue) break;
@@ -826,6 +848,8 @@ function createWebServer(config, watcher, taskQueue, pmManager, router) {
     taskQueue.on('rules:changed', (rules) => broadcast({ type: 'rules:list', rules }));
     taskQueue.on('designations:changed', (designations) => broadcast({ type: 'designations:status', designations }));
     taskQueue.on('vim:changed', (enabled) => broadcast({ type: 'vim:status', enabled }));
+    taskQueue.on('spawn:config:changed', ({ min, max, tmuxDir }) => broadcast({ type: 'spawn:config', min, max, tmuxDir }));
+    taskQueue.on('spawn:log', (message) => broadcast({ type: 'spawn:log', message }));
   }
 
   if (pmManager) {

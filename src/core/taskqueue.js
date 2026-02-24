@@ -45,6 +45,10 @@ class TaskQueue extends EventEmitter {
     this.activeTaskBySession = new Map(); // session num -> task id
     this.spawnedAgents = new Map();  // slot num -> { repoDir, name }
     this.vimMode = false;
+    this.spawnSlotMin = parseInt(process.env.SPAWN_SLOT_MIN) || 17;
+    this.spawnSlotMax = parseInt(process.env.SPAWN_SLOT_MAX) || 32;
+    this.spawnTmuxDir = process.env.SPAWN_TMUX_DIR || path.join(os.homedir(), '.claude', 'tmux');
+    this.spawnDebug = false;
 
     // Auto-pilot rules
     this.rules = [
@@ -414,6 +418,27 @@ class TaskQueue extends EventEmitter {
     this.emit('vim:changed', this.vimMode);
   }
 
+  // -- Spawn range --------------------------------------------------
+
+  setSpawnRange(min, max, tmuxDir) {
+    min = Number(min);
+    max = Number(max);
+    if (!Number.isInteger(min) || !Number.isInteger(max)) throw new Error('Min and max must be integers');
+    if (min < 1 || max > 99) throw new Error('Range must be between 1 and 99');
+    if (min > max) throw new Error('Min must be <= max');
+    this.spawnSlotMin = min;
+    this.spawnSlotMax = max;
+    if (typeof tmuxDir === 'string' && tmuxDir.trim()) {
+      this.spawnTmuxDir = tmuxDir.trim().replace(/^~/, os.homedir());
+    }
+    this._saveState();
+    this.emit('spawn:config:changed', { min, max, tmuxDir: this.spawnTmuxDir });
+  }
+
+  getSpawnRange() {
+    return { min: this.spawnSlotMin, max: this.spawnSlotMax, tmuxDir: this.spawnTmuxDir };
+  }
+
   // -- Designations -------------------------------------------------
 
   setDesignation(num, designation) {
@@ -441,7 +466,7 @@ class TaskQueue extends EventEmitter {
     const sessions = await fleet.getFleetStatus(this.config, this.router);
     const occupied = new Set(sessions.map(s => s.num));
     const slots = [];
-    for (let i = 17; i <= 32; i++) {
+    for (let i = this.spawnSlotMin; i <= this.spawnSlotMax; i++) {
       if (!occupied.has(i)) slots.push(i);
     }
     return slots;
@@ -459,46 +484,61 @@ class TaskQueue extends EventEmitter {
 
   async spawnSession({ num, baseDir, name, gitUrl, skipPermissions } = {}) {
     if (!name) throw new Error('Agent name is required');
+    const debug = this.spawnDebug;
+    const log = (msg) => {
+      if (debug) console.log(`[spawn:debug] ${msg}`);
+      this.emit('spawn:log', msg);
+    };
 
     // Resolve base directory
     baseDir = (baseDir || '~/Coding').replace(/^~/, os.homedir());
+    log(`Starting spawn: name="${name}", baseDir="${baseDir}", slot=${num || 'auto'}, gitUrl=${gitUrl || 'none'}`);
 
     // Pick slot
     if (num === undefined || num === null) {
       const slots = await this.getAvailableSlots();
-      if (!slots.length) throw new Error('No available slots (17-32 all occupied)');
+      log(`Available slots (${this.spawnSlotMin}-${this.spawnSlotMax}): [${slots.join(', ')}]`);
+      if (!slots.length) throw new Error(`No available slots (${this.spawnSlotMin}-${this.spawnSlotMax} all occupied)`);
       num = slots[0];
+      log(`Auto-picked slot ${num}`);
     }
-    if (num < 17 || num > 32) throw new Error('Spawn slots must be 17-32');
+    if (num < this.spawnSlotMin || num > this.spawnSlotMax) {
+      throw new Error(`Spawn slots must be ${this.spawnSlotMin}-${this.spawnSlotMax}`);
+    }
 
     const sessions = await fleet.getFleetStatus(this.config, this.router);
+    log(`Fleet has ${sessions.length} sessions: [${sessions.map(s => `${s.num}:${s.name}`).join(', ')}]`);
     const existing = sessions.find(s => s.num === num);
 
     // Build repo path: baseDir/name+num (e.g. ~/Coding/ios17)
     const repoDir = path.join(baseDir, `${name}${num}`);
+    log(`Repo dir: ${repoDir}`);
 
     // Re-spawn: if session exists in tmux, reuse it
     if (existing) {
       const prev = this.spawnedAgents.get(num);
       if (prev && prev.repoDir === repoDir) {
-        // Same slot, same dir — already running, just update metadata
+        log(`Slot ${num} already running with same dir — reusing`);
         this.pushFeed('state', num, `Agent "${name}" already running in slot ${num}`);
         return { num, repoDir };
       }
-      // Different agent in this slot — can't overwrite a live session
       throw new Error(`Slot ${num} is occupied by "${existing.name}". Kill it first or pick another slot.`);
     }
 
     // Prepare directory (skip if it already exists from a previous spawn)
     const dirExists = fs.existsSync(repoDir);
+    log(`Directory ${repoDir} exists: ${dirExists}`);
     if (!dirExists) {
       if (gitUrl) {
+        log(`Cloning ${gitUrl} into ${repoDir}...`);
         try {
           execSync(`git clone ${gitUrl} "${repoDir}"`, { timeout: 60000, stdio: 'pipe' });
+          log('Clone succeeded');
         } catch (err) {
           throw new Error(`Git clone failed: ${err.message}`);
         }
       } else {
+        log(`Creating directory ${repoDir}`);
         try {
           fs.mkdirSync(repoDir, { recursive: true });
         } catch (err) {
@@ -508,15 +548,36 @@ class TaskQueue extends EventEmitter {
     }
 
     // Start tmux session in background using agent.yml template
-    const agentYml = path.join(os.homedir(), 'dev', 'agents', 'tmux', 'agent.yml');
+    const agentYml = path.join(this.spawnTmuxDir, 'agent.yml');
+    const ymlExists = fs.existsSync(agentYml);
+    log(`Agent YML: ${agentYml} (exists: ${ymlExists})`);
+    if (!ymlExists) {
+      throw new Error(`agent.yml not found at ${agentYml} — check Spawn Settings tmux dir`);
+    }
+
     const env = { ...process.env };
     if (skipPermissions) env.SKIP_PERMISSIONS = '1';
+    const args = ['start', '-p', agentYml, `N=${num}`, `ROOT=${repoDir}`];
+    log(`Running: tmuxinator ${args.join(' ')}`);
 
     try {
-      const child = spawnChild('tmuxinator', ['start', agentYml, `N=${num}`, `ROOT=${repoDir}`], {
-        stdio: 'ignore',
+      const child = spawnChild('tmuxinator', args, {
+        stdio: ['ignore', 'pipe', 'pipe'],
         detached: true,
         env,
+      });
+      // Capture stdout/stderr for debugging
+      let stdout = '', stderr = '';
+      child.stdout.on('data', (d) => { stdout += d; });
+      child.stderr.on('data', (d) => { stderr += d; });
+      child.on('exit', (code) => {
+        if (code !== 0) {
+          const errMsg = `tmuxinator exited with code ${code}: ${stderr.trim() || stdout.trim()}`;
+          log(errMsg);
+          this.pushFeed('state', num, `Spawn error: ${errMsg}`);
+        } else {
+          log(`tmuxinator exited successfully`);
+        }
       });
       child.unref();
     } catch (err) {
@@ -526,16 +587,35 @@ class TaskQueue extends EventEmitter {
     // Register spawned agent
     this.spawnedAgents.set(num, { repoDir, name });
     this._saveState();
+    log(`Registered agent in slot ${num}`);
 
     // Wait for init then rename (in background, don't block response)
     setTimeout(() => {
       try {
-        const renameScript = path.join(os.homedir(), 'dev', 'agents', 'tmux', 'rename.sh');
-        execSync(`bash "${renameScript}"`, { timeout: 10000, stdio: 'pipe' });
-      } catch {
-        // Rename is best-effort
+        const renameScript = path.join(this.spawnTmuxDir, 'rename.sh');
+        log(`Running rename: ${renameScript}`);
+        const renameOut = execSync(`bash "${renameScript}" 2>&1`, { timeout: 10000 }).toString().trim();
+        if (renameOut) log(`Rename output: ${renameOut}`);
+      } catch (err) {
+        log(`Rename failed: ${err.message}`);
       }
     }, 2000);
+
+    // Verify tmux session exists after a delay
+    setTimeout(async () => {
+      try {
+        const postSessions = await fleet.getFleetStatus(this.config, this.router);
+        const found = postSessions.find(s => s.num === num);
+        if (found) {
+          log(`Verified: session ${num} (${found.name}) is in fleet`);
+        } else {
+          const allTmux = await this.router.listAllSessions();
+          log(`Session ${num} NOT found in fleet. All tmux sessions: [${allTmux.map(s => s.name).join(', ')}]`);
+        }
+      } catch (err) {
+        log(`Post-spawn verification failed: ${err.message}`);
+      }
+    }, 5000);
 
     const action = dirExists ? 're-spawned (reused directory)' : 'spawned';
     this.pushFeed('state', num, `Agent "${name}" ${action} in slot ${num}`);
@@ -728,6 +808,9 @@ class TaskQueue extends EventEmitter {
         }
       }
       if (data.vimMode !== undefined) this.vimMode = data.vimMode;
+      if (typeof data.spawnSlotMin === 'number') this.spawnSlotMin = data.spawnSlotMin;
+      if (typeof data.spawnSlotMax === 'number') this.spawnSlotMax = data.spawnSlotMax;
+      if (typeof data.spawnTmuxDir === 'string') this.spawnTmuxDir = data.spawnTmuxDir;
       // Restore tasks
       if (Array.isArray(data.tasks)) {
         for (const t of data.tasks) {
@@ -762,6 +845,9 @@ class TaskQueue extends EventEmitter {
       spawnedAgents: spawnedObj,
       tasks: tasksArr,
       vimMode: this.vimMode,
+      spawnSlotMin: this.spawnSlotMin,
+      spawnSlotMax: this.spawnSlotMax,
+      spawnTmuxDir: this.spawnTmuxDir,
     };
     // Merge PM data if pmManager is attached
     if (this._pmManager) {
