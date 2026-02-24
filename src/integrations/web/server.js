@@ -10,6 +10,39 @@ const git = require('../../core/git');
 const RemoteNode = require('../../core/remote-node');
 
 /**
+ * Detect the Tailscale interface IP address.
+ * Tailscale uses the CGNAT range: 100.64.0.0/10
+ */
+function getTailscaleIP() {
+  const interfaces = os.networkInterfaces();
+  for (const addrs of Object.values(interfaces)) {
+    for (const addr of addrs) {
+      if (addr.family === 'IPv4' && !addr.internal) {
+        const octets = addr.address.split('.').map(Number);
+        if (octets[0] === 100 && octets[1] >= 64 && octets[1] <= 127) {
+          return addr.address;
+        }
+      }
+    }
+  }
+  return null;
+}
+
+/**
+ * Determine which hosts to bind the web server to.
+ * Defaults to 127.0.0.1 + Tailscale IP (if available).
+ * Override with WEB_BIND env var (comma-separated).
+ */
+function getBindHosts() {
+  const bindEnv = process.env.WEB_BIND;
+  if (bindEnv) return bindEnv.split(',').map(h => h.trim());
+  const hosts = ['127.0.0.1'];
+  const tsIP = getTailscaleIP();
+  if (tsIP) hosts.push(tsIP);
+  return hosts;
+}
+
+/**
  * Scan a directory for Claude command .md files and parse frontmatter.
  * Returns array of { name, description }.
  */
@@ -93,8 +126,7 @@ function createWebServer(config, watcher, taskQueue, pmManager, router) {
   const app = express();
   app.use(express.static(path.join(__dirname, 'public')));
 
-  const server = http.createServer(app);
-  const wss = new WebSocketServer({ server });
+  const wss = new WebSocketServer({ noServer: true });
 
   // Discover available slash commands
   const commands = discoverCommands(config);
@@ -833,33 +865,53 @@ function createWebServer(config, watcher, taskQueue, pmManager, router) {
     pmManager.on('pm:changed', () => broadcast({ type: 'pm:list', pms: pmManager.getAll() }));
   }
 
-  // -- Start server -------------------------------------------------------
+  // -- Start servers (localhost + Tailscale only) ---------------------------
 
-  server.listen(port, () => {
-    console.log(`Web dashboard: http://localhost:${port}`);
-    if (workerSecret) {
-      console.log(`Worker registration enabled (workers connect to ws://localhost:${port})`);
-    }
-  });
+  const bindHosts = getBindHosts();
+  const servers = [];
 
-  // Cleanup helper
-  server.on('close', () => {
+  for (const host of bindHosts) {
+    const httpServer = http.createServer(app);
+    httpServer.on('upgrade', (request, socket, head) => {
+      wss.handleUpgrade(request, socket, head, (ws) => {
+        wss.emit('connection', ws, request);
+      });
+    });
+    httpServer.listen(port, host, () => {
+      console.log(`Web dashboard: http://${host}:${port}`);
+    });
+    servers.push(httpServer);
+  }
+
+  if (workerSecret) {
+    console.log(`Worker registration enabled on port ${port}`);
+  }
+
+  const tsIP = getTailscaleIP();
+  if (tsIP) {
+    console.log(`Tailscale access enabled (${tsIP})`);
+  } else if (!process.env.WEB_BIND) {
+    console.log('No Tailscale interface found — dashboard is localhost-only');
+  }
+
+  // Cleanup
+  function close() {
     clearInterval(fleetInterval);
     for (const ws of clients) {
       clearTermSub(ws);
       ws.close();
     }
     clients.clear();
-    // Clean up worker connections
     for (const [ws, node] of workers) {
       node.disconnect();
       router.removeNode(node.id);
       ws.close();
     }
     workers.clear();
-  });
+    for (const s of servers) s.close();
+  }
 
-  return { app, server, wss };
+  return { app, servers, wss, close };
 }
 
 module.exports = { createWebServer };

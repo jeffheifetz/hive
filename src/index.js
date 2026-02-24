@@ -78,13 +78,13 @@ process.on('SIGINT', () => {
   console.log('\nShutting down...');
   pmManager.stopAll();
   watcher.stop();
-  if (webServer) webServer.server.close();
+  if (webServer) webServer.close();
   process.exit(0);
 });
 
 process.on('SIGTERM', () => {
   pmManager.stopAll();
   watcher.stop();
-  if (webServer) webServer.server.close();
+  if (webServer) webServer.close();
   process.exit(0);
 });
