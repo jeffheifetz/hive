@@ -1337,6 +1337,10 @@ html, body { height: 100%; background: var(--bg); color: var(--fg); font-family:
       </select>
     </div>
     <div class="pm-form-field">
+      <label class="pm-form-label">Task Format <span style="color:var(--dim)">(use {key} and {summary} as placeholders)</span></label>
+      <input class="pm-form-input" id="pm-form-taskformat" type="text" placeholder="e.g. /start-task {key}" autocomplete="off">
+    </div>
+    <div class="pm-form-field">
       <label class="pm-form-label">Instructions <span style="color:var(--dim)">(included with each task)</span></label>
       <textarea class="pm-form-input" id="pm-form-instructions" rows="3" placeholder="e.g. Post a review comment on the PR — DO NOT approve" style="resize:vertical;font-family:inherit"></textarea>
     </div>
@@ -3552,6 +3556,7 @@ html, body { height: 100%; background: var(--bg); color: var(--fg); font-family:
       name: document.getElementById('pm-form-name').value.trim(),
       source,
       designation: document.getElementById('pm-form-designation').value || null,
+      taskFormat: document.getElementById('pm-form-taskformat').value.trim() || null,
       instructions: document.getElementById('pm-form-instructions').value.trim(),
       autoThreshold: parseInt(document.getElementById('pm-form-threshold').value) || 3,
       pollInterval: parseInt(document.getElementById('pm-form-interval').value) || 60000,
@@ -3584,6 +3589,7 @@ html, body { height: 100%; background: var(--bg); color: var(--fg); font-family:
     document.getElementById('pm-form-zoho-status').value = src.status || '';
     document.getElementById('pm-form-zoho-query').value = src.query || '';
     document.getElementById('pm-form-designation').value = pm ? (pm.designation || '') : '';
+    document.getElementById('pm-form-taskformat').value = pm ? (pm.taskFormat || '') : '';
     document.getElementById('pm-form-instructions').value = pm ? (pm.instructions || '') : '';
     document.getElementById('pm-form-threshold').value = pm ? pm.autoThreshold : 3;
     document.getElementById('pm-form-interval').value = pm ? pm.pollInterval : 60000;

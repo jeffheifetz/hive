@@ -26,6 +26,7 @@ class ProjectManager extends EventEmitter {
       instructions: cfg.instructions || '',
       autoThreshold: cfg.autoThreshold != null ? cfg.autoThreshold : 3,
       pollInterval: cfg.pollInterval || 60000,
+      taskFormat: cfg.taskFormat || null,
       enabled: false,
       seenKeys: [],
       tasksCreated: 0,
@@ -106,6 +107,7 @@ class ProjectManager extends EventEmitter {
         instructions: data.instructions || '',
         autoThreshold: data.autoThreshold != null ? data.autoThreshold : 3,
         pollInterval: data.pollInterval || 60000,
+        taskFormat: data.taskFormat || null,
         enabled: data.enabled || false,
         seenKeys: Array.isArray(data.seenKeys) ? data.seenKeys : [],
         tasksCreated: data.tasksCreated || 0,
@@ -162,7 +164,11 @@ class ProjectManager extends EventEmitter {
     const key = `manual-${id}-${Date.now()}`;
     pm.seenKeys.push(key);
     const mode = 'manual'; // manual tasks always go to manual queue
-    const fullText = pm.instructions ? `${text}\n\nInstructions: ${pm.instructions}` : text;
+    let taskText = text;
+    if (pm.taskFormat) {
+      taskText = pm.taskFormat.replace('{key}', key).replace('{summary}', text);
+    }
+    const fullText = pm.instructions ? `${taskText}\n\nInstructions: ${pm.instructions}` : taskText;
     this.taskQueue.createTask(fullText, mode, null, pm.designation);
     pm.tasksCreated++;
     pm.lastPoll = Date.now();
@@ -206,7 +212,12 @@ class ProjectManager extends EventEmitter {
 
         // Evaluate complexity
         const mode = this._evaluateComplexity(issue, pm.autoThreshold);
-        const text = `[${issue.key}] ${issue.summary}`;
+        let text;
+        if (pm.taskFormat) {
+          text = pm.taskFormat.replace('{key}', issue.key).replace('{summary}', issue.summary);
+        } else {
+          text = `[${issue.key}] ${issue.summary}`;
+        }
         const fullText = pm.instructions ? `${text}\n\nInstructions: ${pm.instructions}` : text;
         this.taskQueue.createTask(fullText, mode, null, pm.designation);
         created++;
